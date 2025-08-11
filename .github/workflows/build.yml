@@ -39,12 +39,13 @@ jobs:
           - name: kaniko
             image: gcr.io/kaniko-project/executor:latest
             args:
-            - "--context=dir://workspace"
+            - "--context=/workspace"
             - "--dockerfile=Dockerfile"
             - "--destination=harbor.local/library/${{ github.event.repository.name }}:${{ steps.build-id.outputs.BUILD_ID }}"
             - "--destination=harbor.local/library/${{ github.event.repository.name }}:latest"
             - "--insecure"
             - "--skip-tls-verify"
+            - "--verbosity=debug"
             env:
             - name: DOCKER_CONFIG
               value: /kaniko/.docker
@@ -62,14 +63,35 @@ jobs:
               name: build-source-${{ steps.build-id.outputs.BUILD_ID }}
         EOF
     
+    - name: Wait for Pod to start
+      run: |
+        echo "Waiting for pod to start..."
+        sleep 10
+        kubectl get pod kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner
+    
     - name: Wait for build completion
       run: |
-        kubectl wait --for=condition=Ready pod/kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} \
-          -n github-runner --timeout=600s
+        echo "Waiting for build to complete..."
+        kubectl wait --for=condition=Complete pod/kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} \
+          -n github-runner --timeout=1200s || true
     
     - name: Get build logs
       run: |
-        kubectl logs kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner
+        echo "=== Build Logs ==="
+        kubectl logs kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner || true
+        echo "=== Pod Status ==="
+        kubectl describe pod kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner || true
+    
+    - name: Check if build succeeded
+      run: |
+        POD_STATUS=$(kubectl get pod kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner -o jsonpath='{.status.phase}')
+        echo "Pod status: $POD_STATUS"
+        if [ "$POD_STATUS" = "Succeeded" ]; then
+          echo "✅ Build succeeded!"
+        else
+          echo "❌ Build failed!"
+          exit 1
+        fi
     
     - name: Cleanup
       if: always()
