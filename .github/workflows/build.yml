@@ -1,0 +1,78 @@
+name: Build and Push to Harbor
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: self-hosted
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Generate build ID
+      id: build-id
+      run: echo "BUILD_ID=$(date +%Y%m%d-%H%M%S)-$(echo $GITHUB_SHA | head -c 8)" >> $GITHUB_OUTPUT
+    
+    - name: Create source ConfigMap
+      run: |
+        kubectl create configmap build-source-${{ steps.build-id.outputs.BUILD_ID }} \
+          --from-file=. \
+          --namespace=github-runner \
+          --dry-run=client -o yaml | kubectl apply -f -
+    
+    - name: Build with Kaniko
+      run: |
+        kubectl apply -f - <<EOF
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: kaniko-build-${{ steps.build-id.outputs.BUILD_ID }}
+          namespace: github-runner
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: kaniko
+            image: gcr.io/kaniko-project/executor:latest
+            args:
+            - "--context=dir://workspace"
+            - "--dockerfile=Dockerfile"
+            - "--destination=harbor.local/library/${{ github.event.repository.name }}:${{ steps.build-id.outputs.BUILD_ID }}"
+            - "--destination=harbor.local/library/${{ github.event.repository.name }}:latest"
+            - "--insecure"
+            - "--skip-tls-verify"
+            env:
+            - name: DOCKER_CONFIG
+              value: /kaniko/.docker
+            volumeMounts:
+            - name: docker-config
+              mountPath: /kaniko/.docker
+            - name: workspace
+              mountPath: /workspace
+          volumes:
+          - name: docker-config
+            secret:
+              secretName: harbor-docker-config
+          - name: workspace
+            configMap:
+              name: build-source-${{ steps.build-id.outputs.BUILD_ID }}
+        EOF
+    
+    - name: Wait for build completion
+      run: |
+        kubectl wait --for=condition=Ready pod/kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} \
+          -n github-runner --timeout=600s
+    
+    - name: Get build logs
+      run: |
+        kubectl logs kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        kubectl delete pod kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner || true
+        kubectl delete configmap build-source-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner || true
