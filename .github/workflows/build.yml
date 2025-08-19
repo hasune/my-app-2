@@ -1,159 +1,95 @@
-name: Test Build and Push
+name: Build and Push to Harbor (Docker)
 
 on:
-  workflow_dispatch:  # 수동 실행용
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  HARBOR_REGISTRY: "harbor.local"
+  HARBOR_PROJECT: "library"
 
 jobs:
-  test-build:
+  build:
     runs-on: self-hosted
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Check environment
-      run: |
-        echo "=== Environment Check ==="
-        echo "Current user: $(whoami)"
-        echo "Kubectl version:"
-        kubectl version --client
-        echo ""
-        echo "=== Namespace check ==="
-        kubectl get namespace github-runner || echo "❌ Namespace github-runner not found"
-        echo ""
-        echo "=== Secret check ==="
-        kubectl get secret harbor-docker-config -n github-runner || echo "❌ Harbor secret not found"
-        echo ""
-        echo "=== Node info ==="
-        kubectl get nodes
-        echo ""
-        echo "=== Current directory ==="
-        ls -la
-        echo ""
-        echo "=== File contents ==="
-        echo "--- package.json ---"
-        cat package.json
-        echo "--- index.js ---"
-        cat index.js
-        echo "--- Dockerfile ---"
-        cat Dockerfile
-    
     - name: Generate build ID
       id: build-id
-      run: |
-        BUILD_ID=$(date +%Y%m%d-%H%M%S)-$(echo $GITHUB_SHA | head -c 8)
-        echo "BUILD_ID=$BUILD_ID" >> $GITHUB_OUTPUT
-        echo "Generated BUILD_ID: $BUILD_ID"
+      run: echo "BUILD_ID=$(date +%Y%m%d-%H%M%S)-$(echo $GITHUB_SHA | head -c 8)" >> $GITHUB_OUTPUT
     
-    - name: Create test ConfigMap
+    - name: Set up Docker environment
       run: |
-        echo "Creating ConfigMap with build files..."
+        # Docker 버전 확인
+        docker --version
+        docker info
         
-        # 기존 ConfigMap 정리
-        kubectl delete configmap test-build-source-${{ steps.build-id.outputs.BUILD_ID }} \
-          --namespace=github-runner --ignore-not-found=true
-        
-        # ConfigMap 생성
-        kubectl create configmap test-build-source-${{ steps.build-id.outputs.BUILD_ID }} \
-          --from-file=package.json \
-          --from-file=index.js \
-          --from-file=Dockerfile \
-          --namespace=github-runner
-          
-        echo "✅ ConfigMap created successfully"
-        
-        # ConfigMap 내용 확인
-        kubectl get configmap test-build-source-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner -o yaml
+        # Harbor 연결 테스트
+        curl -f "http://${{ env.HARBOR_REGISTRY }}/api/v2.0/systeminfo" || {
+          echo "❌ Harbor not accessible"
+          exit 1
+        }
+        echo "✅ Harbor accessible"
     
-    - name: Test Harbor connectivity
+    - name: Login to Harbor
       run: |
-        echo "Testing Harbor connectivity..."
-        
-        # Harbor ping 테스트
-        if curl -k -f http://harbor.local/api/v2.0/systeminfo --connect-timeout 10; then
-          echo "✅ Harbor is accessible via HTTP"
-        elif curl -k -f https://harbor.local/api/v2.0/systeminfo --connect-timeout 10; then
-          echo "✅ Harbor is accessible via HTTPS"
-        else
-          echo "❌ Harbor is not accessible"
-          echo "Trying to resolve harbor.local..."
-          nslookup harbor.local || echo "DNS resolution failed"
-        fi
+        echo "Harbor12345!" | docker login ${{ env.HARBOR_REGISTRY }} \
+          --username admin --password-stdin
+        echo "✅ Logged in to Harbor"
     
-    - name: Create test Kaniko pod
+    - name: Build Docker image
       run: |
-        echo "Creating Kaniko test pod..."
+        IMAGE_NAME="${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ github.event.repository.name }}"
+        BUILD_TAG="${{ steps.build-id.outputs.BUILD_ID }}"
         
-        cat <<EOF | kubectl apply -f -
-        apiVersion: v1
-        kind: Pod
-        metadata:
-          name: kaniko-test-${{ steps.build-id.outputs.BUILD_ID }}
-          namespace: github-runner
-        spec:
-          restartPolicy: Never
-          containers:
-          - name: kaniko
-            image: gcr.io/kaniko-project/executor:v1.15.0
-            args:
-            - "--context=/workspace"
-            - "--dockerfile=/workspace/Dockerfile"
-            - "--destination=harbor.local/library/my-app:test-${{ steps.build-id.outputs.BUILD_ID }}"
-            - "--insecure"
-            - "--skip-tls-verify"
-            - "--verbosity=debug"
-            - "--no-push"  # 실제 push 하지 않고 빌드만 테스트
-            env:
-            - name: DOCKER_CONFIG
-              value: /kaniko/.docker
-            volumeMounts:
-            - name: docker-config
-              mountPath: /kaniko/.docker
-              readOnly: true
-            - name: workspace
-              mountPath: /workspace
-          volumes:
-          - name: docker-config
-            secret:
-              secretName: harbor-docker-config
-              items:
-              - key: .dockerconfigjson
-                path: config.json
-          - name: workspace
-            configMap:
-              name: test-build-source-${{ steps.build-id.outputs.BUILD_ID }}
-        EOF
+        echo "Building image: ${IMAGE_NAME}:${BUILD_TAG}"
         
-        echo "✅ Pod created"
+        # Docker 이미지 빌드
+        docker build -t "${IMAGE_NAME}:${BUILD_TAG}" .
+        docker tag "${IMAGE_NAME}:${BUILD_TAG}" "${IMAGE_NAME}:latest"
+        
+        echo "✅ Image built successfully"
+        echo "Built images:"
+        docker images | grep "${{ github.event.repository.name }}"
     
-    - name: Monitor test build
+    - name: Push to Harbor
       run: |
-        echo "Waiting for pod to start..."
+        IMAGE_NAME="${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ github.event.repository.name }}"
+        BUILD_TAG="${{ steps.build-id.outputs.BUILD_ID }}"
         
-        # Pod가 시작될 때까지 대기
-        for i in {1..30}; do
-          STATUS=$(kubectl get pod kaniko-test-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
-          echo "Attempt $i: Pod status = $STATUS"
-          
-          if [ "$STATUS" = "Running" ] || [ "$STATUS" = "Succeeded" ] || [ "$STATUS" = "Failed" ]; then
-            break
-          fi
-          sleep 5
-        done
+        echo "Pushing images to Harbor..."
         
-        echo "=== Pod Description ==="
-        kubectl describe pod kaniko-test-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner
+        # 이미지 푸시
+        docker push "${IMAGE_NAME}:${BUILD_TAG}"
+        docker push "${IMAGE_NAME}:latest"
         
-        echo "=== Pod Logs ==="
-        kubectl logs kaniko-test-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner || echo "No logs available yet"
-        
-        echo "=== Final Status ==="
-        kubectl get pod kaniko-test-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner
+        echo "✅ Images pushed successfully:"
+        echo "  - ${IMAGE_NAME}:${BUILD_TAG}"
+        echo "  - ${IMAGE_NAME}:latest"
     
-    - name: Cleanup test resources
+    - name: Verify Harbor push
+      run: |
+        echo "Verifying image in Harbor..."
+        
+        # Harbor API로 이미지 확인
+        REPO_NAME="${{ github.event.repository.name }}"
+        curl -s -u admin:Harbor12345! \
+          "http://${{ env.HARBOR_REGISTRY }}/api/v2.0/projects/${{ env.HARBOR_PROJECT }}/repositories/${REPO_NAME}/artifacts" \
+          | jq -r '.[].tags[].name' 2>/dev/null || {
+          echo "API verification failed, but push might be successful"
+        }
+    
+    - name: Cleanup local images
       if: always()
       run: |
-        echo "Cleaning up test resources..."
-        kubectl delete pod kaniko-test-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner --ignore-not-found=true
-        kubectl delete configmap test-build-source-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner --ignore-not-found=true
+        IMAGE_NAME="${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ github.event.repository.name }}"
+        BUILD_TAG="${{ steps.build-id.outputs.BUILD_ID }}"
+        
+        # 로컬 이미지 정리 (선택적)
+        docker rmi "${IMAGE_NAME}:${BUILD_TAG}" "${IMAGE_NAME}:latest" || true
+        
         echo "✅ Cleanup completed"
