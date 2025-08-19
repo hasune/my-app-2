@@ -1,100 +1,159 @@
-name: Build and Push to Harbor
+name: Test Build and Push
 
 on:
-  push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main ]
+  workflow_dispatch:  # 수동 실행용
 
 jobs:
-  build:
+  test-build:
     runs-on: self-hosted
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
     
+    - name: Check environment
+      run: |
+        echo "=== Environment Check ==="
+        echo "Current user: $(whoami)"
+        echo "Kubectl version:"
+        kubectl version --client
+        echo ""
+        echo "=== Namespace check ==="
+        kubectl get namespace github-runner || echo "❌ Namespace github-runner not found"
+        echo ""
+        echo "=== Secret check ==="
+        kubectl get secret harbor-docker-config -n github-runner || echo "❌ Harbor secret not found"
+        echo ""
+        echo "=== Node info ==="
+        kubectl get nodes
+        echo ""
+        echo "=== Current directory ==="
+        ls -la
+        echo ""
+        echo "=== File contents ==="
+        echo "--- package.json ---"
+        cat package.json
+        echo "--- index.js ---"
+        cat index.js
+        echo "--- Dockerfile ---"
+        cat Dockerfile
+    
     - name: Generate build ID
       id: build-id
-      run: echo "BUILD_ID=$(date +%Y%m%d-%H%M%S)-$(echo $GITHUB_SHA | head -c 8)" >> $GITHUB_OUTPUT
-    
-    - name: Create source ConfigMap
       run: |
-        kubectl create configmap build-source-${{ steps.build-id.outputs.BUILD_ID }} \
-          --from-file=. \
-          --namespace=github-runner \
-          --dry-run=client -o yaml | kubectl apply -f -
+        BUILD_ID=$(date +%Y%m%d-%H%M%S)-$(echo $GITHUB_SHA | head -c 8)
+        echo "BUILD_ID=$BUILD_ID" >> $GITHUB_OUTPUT
+        echo "Generated BUILD_ID: $BUILD_ID"
     
-    - name: Build with Kaniko
+    - name: Create test ConfigMap
       run: |
-        kubectl apply -f - <<EOF
+        echo "Creating ConfigMap with build files..."
+        
+        # 기존 ConfigMap 정리
+        kubectl delete configmap test-build-source-${{ steps.build-id.outputs.BUILD_ID }} \
+          --namespace=github-runner --ignore-not-found=true
+        
+        # ConfigMap 생성
+        kubectl create configmap test-build-source-${{ steps.build-id.outputs.BUILD_ID }} \
+          --from-file=package.json \
+          --from-file=index.js \
+          --from-file=Dockerfile \
+          --namespace=github-runner
+          
+        echo "✅ ConfigMap created successfully"
+        
+        # ConfigMap 내용 확인
+        kubectl get configmap test-build-source-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner -o yaml
+    
+    - name: Test Harbor connectivity
+      run: |
+        echo "Testing Harbor connectivity..."
+        
+        # Harbor ping 테스트
+        if curl -k -f http://harbor.local/api/v2.0/systeminfo --connect-timeout 10; then
+          echo "✅ Harbor is accessible via HTTP"
+        elif curl -k -f https://harbor.local/api/v2.0/systeminfo --connect-timeout 10; then
+          echo "✅ Harbor is accessible via HTTPS"
+        else
+          echo "❌ Harbor is not accessible"
+          echo "Trying to resolve harbor.local..."
+          nslookup harbor.local || echo "DNS resolution failed"
+        fi
+    
+    - name: Create test Kaniko pod
+      run: |
+        echo "Creating Kaniko test pod..."
+        
+        cat <<EOF | kubectl apply -f -
         apiVersion: v1
         kind: Pod
         metadata:
-          name: kaniko-build-${{ steps.build-id.outputs.BUILD_ID }}
+          name: kaniko-test-${{ steps.build-id.outputs.BUILD_ID }}
           namespace: github-runner
         spec:
           restartPolicy: Never
           containers:
           - name: kaniko
-            image: gcr.io/kaniko-project/executor:latest
+            image: gcr.io/kaniko-project/executor:v1.15.0
             args:
             - "--context=/workspace"
-            - "--dockerfile=Dockerfile"
-            - "--destination=harbor.local/library/${{ github.event.repository.name }}:${{ steps.build-id.outputs.BUILD_ID }}"
-            - "--destination=harbor.local/library/${{ github.event.repository.name }}:latest"
+            - "--dockerfile=/workspace/Dockerfile"
+            - "--destination=harbor.local/library/my-app:test-${{ steps.build-id.outputs.BUILD_ID }}"
             - "--insecure"
             - "--skip-tls-verify"
             - "--verbosity=debug"
+            - "--no-push"  # 실제 push 하지 않고 빌드만 테스트
             env:
             - name: DOCKER_CONFIG
               value: /kaniko/.docker
             volumeMounts:
             - name: docker-config
               mountPath: /kaniko/.docker
+              readOnly: true
             - name: workspace
               mountPath: /workspace
           volumes:
           - name: docker-config
             secret:
               secretName: harbor-docker-config
+              items:
+              - key: .dockerconfigjson
+                path: config.json
           - name: workspace
             configMap:
-              name: build-source-${{ steps.build-id.outputs.BUILD_ID }}
+              name: test-build-source-${{ steps.build-id.outputs.BUILD_ID }}
         EOF
+        
+        echo "✅ Pod created"
     
-    - name: Wait for Pod to start
+    - name: Monitor test build
       run: |
         echo "Waiting for pod to start..."
-        sleep 10
-        kubectl get pod kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner
+        
+        # Pod가 시작될 때까지 대기
+        for i in {1..30}; do
+          STATUS=$(kubectl get pod kaniko-test-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+          echo "Attempt $i: Pod status = $STATUS"
+          
+          if [ "$STATUS" = "Running" ] || [ "$STATUS" = "Succeeded" ] || [ "$STATUS" = "Failed" ]; then
+            break
+          fi
+          sleep 5
+        done
+        
+        echo "=== Pod Description ==="
+        kubectl describe pod kaniko-test-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner
+        
+        echo "=== Pod Logs ==="
+        kubectl logs kaniko-test-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner || echo "No logs available yet"
+        
+        echo "=== Final Status ==="
+        kubectl get pod kaniko-test-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner
     
-    - name: Wait for build completion
-      run: |
-        echo "Waiting for build to complete..."
-        kubectl wait --for=condition=Complete pod/kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} \
-          -n github-runner --timeout=1200s || true
-    
-    - name: Get build logs
-      run: |
-        echo "=== Build Logs ==="
-        kubectl logs kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner || true
-        echo "=== Pod Status ==="
-        kubectl describe pod kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner || true
-    
-    - name: Check if build succeeded
-      run: |
-        POD_STATUS=$(kubectl get pod kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner -o jsonpath='{.status.phase}')
-        echo "Pod status: $POD_STATUS"
-        if [ "$POD_STATUS" = "Succeeded" ]; then
-          echo "✅ Build succeeded!"
-        else
-          echo "❌ Build failed!"
-          exit 1
-        fi
-    
-    - name: Cleanup
+    - name: Cleanup test resources
       if: always()
       run: |
-        kubectl delete pod kaniko-build-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner || true
-        kubectl delete configmap build-source-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner || true
+        echo "Cleaning up test resources..."
+        kubectl delete pod kaniko-test-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner --ignore-not-found=true
+        kubectl delete configmap test-build-source-${{ steps.build-id.outputs.BUILD_ID }} -n github-runner --ignore-not-found=true
+        echo "✅ Cleanup completed"
