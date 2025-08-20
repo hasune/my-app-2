@@ -4,7 +4,7 @@ const port = 3000;
 
 app.get('/', (req, res) => {
   res.json({
-    message: 'Hello from GitOps Pipeline!',
+    message: 'Hello from GitOps Pipeline! gogogogo',
     version: process.env.VERSION || '1.0.0',
     timestamp: new Date().toISOString()
   });
