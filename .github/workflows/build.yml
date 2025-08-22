@@ -83,6 +83,72 @@ jobs:
           echo "API verification failed, but push might be successful"
         }
     
+    # GitOps 단계 추가
+    - name: Checkout k8s-manifests repository
+      uses: actions/checkout@v4
+      with:
+        repository: hasune/k8s-manifests  # 실제 GitHub 사용자명으로 변경
+        token: ${{ secrets.GITOPS_TOKEN }}  # Personal Access Token 필요
+        path: k8s-manifests
+    
+    - name: Update manifest files
+      run: |
+        IMAGE_NAME="${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ github.event.repository.name }}"
+        BUILD_TAG="${{ steps.build-id.outputs.BUILD_ID }}"
+        NEW_IMAGE="${IMAGE_NAME}:${BUILD_TAG}"
+        
+        echo "Updating manifests with new image: ${NEW_IMAGE}"
+        
+        # 환경별 배포 결정
+        if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          # main 브랜치 → prod 환경
+          MANIFEST_PATH="k8s-manifests/applications/my-app2/prod/deployment.yaml"
+          echo "🚀 Updating PRODUCTION environment"
+        else
+          # develop 브랜치 → dev 환경
+          MANIFEST_PATH="k8s-manifests/applications/my-app2/dev/deployment.yaml"
+          echo "🔧 Updating DEVELOPMENT environment"
+        fi
+        
+        # deployment.yaml 파일에서 이미지 태그 업데이트
+        sed -i "s|image: harbor\.local/library/my-app-2:.*|image: ${NEW_IMAGE}|g" ${MANIFEST_PATH}
+        
+        echo "✅ Manifest updated:"
+        echo "File: ${MANIFEST_PATH}"
+        echo "New image: ${NEW_IMAGE}"
+        
+        # 변경사항 확인
+        cat ${MANIFEST_PATH} | grep "image:"
+    
+    - name: Commit and push manifest changes
+      run: |
+        cd k8s-manifests
+        
+        # Git 설정
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+        
+        # 변경사항이 있는지 확인
+        if git diff --quiet; then
+          echo "No changes to commit"
+          exit 0
+        fi
+        
+        # 커밋 및 푸시
+        BUILD_TAG="${{ steps.build-id.outputs.BUILD_ID }}"
+        BRANCH_NAME="${{ github.ref_name }}"
+        
+        git add .
+        git commit -m "Update my-app2 image to ${BUILD_TAG} from ${BRANCH_NAME} branch
+        
+        - Repository: ${{ github.repository }}
+        - Commit: ${{ github.sha }}
+        - Build ID: ${BUILD_TAG}"
+        
+        git push
+        
+        echo "✅ Manifest changes pushed to k8s-manifests repository"
+    
     - name: Cleanup local images
       if: always()
       run: |
